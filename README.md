@@ -74,19 +74,11 @@ abc.md
 
 ## 編譯
 
-目前版本為 `v1.0.1`，開發者為 **GPT6-Astra 和 Ant**。`-V`／`--version` 顯示版本、編譯日期、Git commit、Git tag、開發者及簡要描述。
+版本號自動取自 Git tag，開發者為 **GPT6-Astra 和 Ant**。`-V`／`--version` 顯示版本、編譯日期、Git commit、Git tag、開發者及簡要描述。
 
-建置腳本預設使用 Asia/Shanghai 當日日期，自動讀取 `git rev-parse HEAD` 與 HEAD 上的 tag。HEAD 沒有 tag 時顯示 `untagged`，無法取得 commit 時顯示 `unknown`；不會自動建立 tag 或 commit。版本資訊使用 Go linker 的 `-X main.<欄位>=<值>` 注入。直接執行 `go build` 而未注入時，日期預設為 `2026-10-26`，commit/tag 為 `unknown`。
+`build.sh` 使用 Asia/Shanghai 當日日期，自動讀取 `git rev-parse HEAD` 的完整 commit hash，以及 `git describe --tags --abbrev=0 HEAD` 找到的最近可達 tag（包含輕量 tag），並以該 tag 作為版本號。沒有可達 tag 時，版本為 `dev`、tag 為 `untagged`；無法取得 commit 時顯示 `unknown`。腳本不會建立 tag 或 commit。
 
-可透過腳本參數覆寫資訊；`build.sh` 和 `build.bat` 均轉交這些參數：
-
-```sh
-go run ./scripts/build.go -date 2026-10-26
-go run ./scripts/build.go -target linux/amd64 -date 2026-10-26 -skip-upx
-go run ./scripts/build.go -version v1.0.1 -date 2026-10-26 -commit abc123 -tag v1.0.1
-```
-
-另支援 `-developers`、`-description` 覆寫文字（含空格時加引號）。不指定 `-target` 時建置全部六個平台；指定時只建置該平台，校驗檔寫入 `dist/SHA256SUMS-linux-amd64` 等對應名稱。預設的 `dist/SHA256SUMS` 仍用於完整建置。
+版本資訊使用 Go linker 的 `-X main.<欄位>=<值>` 注入，不接受命令列參數覆寫。直接執行 `go build` 而未注入時，版本為 `dev`，日期及 commit/tag 為 `unknown`。
 
 需要 Go 1.23 或更新版本。首次編譯需要下載 `go.mod` 中固定版本的解析套件。
 
@@ -99,7 +91,7 @@ go build -trimpath -ldflags="-s -w" -o mdimg .
 
 Windows 可使用 `go build -trimpath -ldflags="-s -w" -o mdimg.exe .`。
 
-使用建置腳本，一次產生所有平台的獨立執行檔及 SHA-256 校驗檔（腳本可從任意工作目錄呼叫）：
+使用建置腳本，預設產生目前電腦作業系統與 CPU 架構的執行檔及 SHA-256 校驗檔（腳本可從任意工作目錄呼叫）：
 
 ```sh
 # macOS / Linux
@@ -107,19 +99,34 @@ sh build.sh
 ```
 
 ```bat
-rem Windows（PowerShell 中使用 .\build.bat）
+rem Windows（需安裝 Git for Windows 並將 sh 加入 PATH；PowerShell 中使用 .\build.bat）
 build.bat
 ```
 
-兩個腳本共用 Go 建置程式，也可在專案根目錄直接執行：
+所有建置邏輯都在 `build.sh` 中；`build.bat` 轉交全部參數並呼叫同一份腳本，兩者支援相同選項：
+
+| 參數 | 功能 |
+| --- | --- |
+| `-l` / `-m` / `-w` | 分別選擇 Linux / macOS / Windows；可同時指定多個 |
+| `-amd` / `-arm` | 分別選擇 x86_64 / ARM64；可同時指定兩個 |
+| `-a` | 編譯上述三種作業系統與兩種架構的全部六個組合，優先於個別平台／架構選項 |
+| `-x` | 編譯後使用 UPX 壓縮；預設不壓縮 |
+| `-h` / `--help` | 顯示使用說明 |
+
+未指定作業系統或架構時，該項分別使用 `go env GOHOSTOS` 或 `go env GOHOSTARCH`，不受交叉編譯環境變數 `GOOS`／`GOARCH` 影響。多個選項會建置所選作業系統與架構的所有組合，例如：
 
 ```sh
-go run ./scripts/build.go
+sh build.sh -l -amd           # Linux x86_64
+sh build.sh -m -w -arm        # macOS 與 Windows ARM64
+sh build.sh -a                # 全部六個組合，不壓縮
+sh build.sh -l -amd -x        # Linux x86_64，使用 UPX 壓縮
 ```
+
+Windows 使用相同參數，例如 `build.bat -a` 或 `build.bat -w -amd -x`。無需提供版本、tag、hash 或日期參數；每次將本次產生的執行檔校驗值寫入 `dist/SHA256SUMS`，其他既有執行檔不會刪除。
 
 建置時使用 `-trimpath -buildvcs=false -ldflags="-s -w -buildid="`，移除符號表、DWARF 除錯資訊、Go build ID、版本控制資訊及本機來源路徑。執行時必需的載入／連結資料與 Go runtime 中繼資料仍會保留，不能刪除所有此類資料而同時確保程式正常執行。
 
-腳本自動在 PATH 中尋找 `upx`。有安裝時預設使用 `--best --ultra-brute`，啟用最高壓縮設定並嘗試更多壓縮組合（耗時較長），再以 `upx -t` 驗證，最後計算 SHA-256。沒有 UPX 時正常輸出未壓縮版本。若 UPX 不支援某個目標格式、無法啟動或壓縮／驗證失敗，會顯示警告並保留該目標的未壓縮執行檔；其他目標繼續建置。
+只有指定 `-x` 時，腳本才在 PATH 中尋找 `upx`，找不到時會報錯並停止建置。壓縮使用 `--best --ultra-brute`，嘗試更多壓縮組合（耗時較長），再以 `upx -t` 驗證，最後計算 SHA-256。若 UPX 不支援某個目標格式、無法啟動或壓縮／驗證失敗，會顯示警告並保留該目標的未壓縮執行檔；其他目標繼續建置。
 
 本機 UPX 5.2.1 預設拒絕壓縮 macOS 執行檔；腳本保留這些目標的未壓縮版本，不使用 `--force-macos` 強制壓縮。
 
@@ -131,7 +138,7 @@ go run ./scripts/build.go
 | `dist/mdimg-linux-arm64` | Linux ARM64 |
 | `dist/mdimg-windows-amd64.exe` | Windows x64 |
 | `dist/mdimg-windows-arm64.exe` | Windows ARM64 |
-| `dist/SHA256SUMS` | 所有執行檔的 SHA-256 |
+| `dist/SHA256SUMS` | 本次建置執行檔的 SHA-256 |
 
 建置腳本設定 `CGO_ENABLED=0`，無需 C 編譯器或第三方動態函式庫。選擇對應系統與架構的檔案；macOS／Linux 複製後執行 `chmod +x mdimg-*`，即可用 `./mdimg-linux-amd64 example.md` 等方式執行，也可重新命名為 `mdimg` 並放進 PATH。macOS 版本未經 Apple 開發者簽署或公證。
 
