@@ -19,17 +19,19 @@ import (
 	"golang.org/x/net/html"
 )
 
-const usage = `Usage: mdimg [-c] [-i] [--convert] [-f file.md] [-r] [-p prefix | -P prefix] [-n] [-w]
+const usage = `Usage: mdimg [-c] [-F] [-i] [-t] [--convert] [-f file.md] [-r] [-p prefix | -P prefix] [-n] [-w]
 
 Print filenames and indented image destinations in document order.
 Local destinations are yellow; HTTP(S) destinations are blue unless checked.
-  -i           Hide filenames and indentation; retain colors and check marks
+  -i           Hide filenames and indentation; retain colors and check marks unless -t
+  -t           Only plain filenames and image destinations; no ANSI, marks or indentation
   --convert    Decode percent escapes in output; use native local path separators
   -v           Print version only
   -V, --version Print version, build date, Git commit/tag and developer details
   -l, --local   Only local paths (including file: URLs)
   --web        Only HTTP(S) and protocol-relative URLs
   -c           Check image existence, grouped by Markdown file
+  -F           Only print filenames with matching images (with -c); overrides -i
   -f file.md   Read this file (repeatable); default: *.md in current directory
   -r           Recursively discover Markdown files
   -p prefix    Image prefix relative to working directory (with -c)
@@ -57,7 +59,8 @@ var (
 )
 
 func run(args []string, out, errOut io.Writer) int {
-	var local, web, endOptions, imagesOnly, convert bool
+	var local, web, endOptions, imagesOnly, plainText, convert bool
+	var filenamesOnly bool
 	var check, recursive, missingOnly, checkWeb, relativePrefix, hasPrefix bool
 	var prefix string
 	var files []string
@@ -86,8 +89,14 @@ func run(args []string, out, errOut io.Writer) int {
 			case "-c":
 				check = true
 				continue
+			case "-F":
+				filenamesOnly = true
+				continue
 			case "-i":
 				imagesOnly = true
+				continue
+			case "-t":
+				plainText = true
 				continue
 			case "--convert":
 				convert = true
@@ -172,9 +181,11 @@ func run(args []string, out, errOut io.Writer) int {
 			if convert {
 				displayPath = convertedPath(path)
 			}
-			line := fmt.Sprintf("\x1b[%sm%s\x1b[0m\n", color, displayPath)
+			mark := ""
 			if check {
-				mark, color, failed := "w", "34", false
+				mark = "w"
+				failed := false
+				color = "34"
 				if kind == "web" && checkWeb {
 					failed = !webExists(client, path)
 					if failed {
@@ -202,10 +213,26 @@ func run(args []string, out, errOut io.Writer) int {
 				if missingOnly && !failed {
 					continue
 				}
-				line = fmt.Sprintf("\x1b[%sm[%s] %s\x1b[0m\n", color, mark, displayPath)
 			}
-			if !imagesOnly {
-				line = "    " + line
+			// Keep all output decorations here so -t stays suitable for pipelines.
+			line := displayPath
+			if !plainText {
+				if mark != "" {
+					line = fmt.Sprintf("[%s] %s", mark, line)
+				}
+				line = fmt.Sprintf("\x1b[%sm%s\x1b[0m", color, line)
+				if !imagesOnly {
+					line = "    " + line
+				}
+			}
+			line += "\n"
+			if check && filenamesOnly {
+				if header {
+					continue
+				}
+				line = file + "\n"
+				header = true
+			} else if !imagesOnly {
 				if !header {
 					line = file + "\n" + line
 					header = true

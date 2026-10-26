@@ -90,6 +90,106 @@ func TestCLI(t *testing.T) {
 	}
 }
 
+func TestPlainText(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.URL.Path == "/missing" {
+			http.NotFound(w, r)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	root := t.TempDir()
+	file := filepath.Join(root, "plain.md")
+	if err := os.WriteFile(filepath.Join(root, "a b.png"), []byte("image"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	okURL, missingURL := server.URL+"/ok", server.URL+"/missing"
+	source := "![a](a%20b.png) ![b](missing.png) ![c](" + okURL + ") ![d](" + missingURL + ") ![duplicate](a%20b.png)"
+	if err := os.WriteFile(file, []byte(source), 0600); err != nil {
+		t.Fatal(err)
+	}
+	paths := "a%20b.png\nmissing.png\n" + okURL + "\n" + missingURL + "\na%20b.png\n"
+	for _, tt := range []struct {
+		name     string
+		args     []string
+		want     string
+		requests int
+	}{
+		{"before filename", []string{"-t", file}, file + "\n" + paths, 0},
+		{"after filename", []string{file, "-t"}, file + "\n" + paths, 0},
+		{"multiple files", []string{"-t", "-f", file, "-f", file}, file + "\n" + paths + file + "\n" + paths, 0},
+		{"images only", []string{"-i", "-t", file}, paths, 0},
+		{"local filter", []string{"-t", "-l", file}, file + "\na%20b.png\nmissing.png\na%20b.png\n", 0},
+		{"web filter", []string{"-t", "--web", "-w", file}, file + "\n" + okURL + "\n" + missingURL + "\n", 0},
+		{"local checks", []string{"-t", "-c", file}, file + "\n" + paths, 0},
+		{"web checks", []string{"-t", "-c", "-w", file}, file + "\n" + paths, 2},
+		{"missing only", []string{"-t", "-c", "-w", "-n", file}, file + "\nmissing.png\n" + missingURL + "\n", 2},
+		{"missing images only", []string{"-t", "-i", "-c", "-w", "-n", file}, "missing.png\n" + missingURL + "\n", 2},
+		{"local missing only", []string{"-t", "-c", "-n", file}, file + "\nmissing.png\n", 0},
+		{"no failed checks", []string{"-t", "-c", "-n", "--web", file}, "", 0},
+		{"converted checks", []string{"-t", "-i", "--convert", "-c", file}, strings.ReplaceAll(paths, "a%20b.png", "a b.png"), 0},
+		{"converted grouped checks", []string{"-c", "-w", "--convert", file, "-t"}, file + "\n" + strings.ReplaceAll(paths, "a%20b.png", "a b.png"), 2},
+		{"filenames only checks all web images", []string{"-F", "-c", "-w", file}, file + "\n", 2},
+		{"filenames only web failures", []string{"-c", "-w", "-n", "--web", file, "-F"}, file + "\n", 2},
+		{"filenames only unchecked web", []string{"-F", "-c", "--web", file}, file + "\n", 0},
+		{"filenames only no failed web checks", []string{"-F", "-c", "-n", "--web", file}, "", 0},
+		{"filenames only plain text", []string{"-F", "-t", "-i", "-c", "-w", file}, file + "\n", 2},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			requests = 0
+			var out, errOut bytes.Buffer
+			if code := run(tt.args, &out, &errOut); code != 0 || out.String() != tt.want || errOut.Len() != 0 {
+				t.Errorf("args %v: code=%d stdout=%q stderr=%q; want stdout=%q", tt.args, code, out.String(), errOut.String(), tt.want)
+			}
+			if requests != tt.requests {
+				t.Errorf("requests=%d, want %d", requests, tt.requests)
+			}
+		})
+	}
+}
+
+func TestFilenamesOnly(t *testing.T) {
+	root := t.TempDir()
+	missing := filepath.Join(root, "missing.md")
+	present := filepath.Join(root, "present.md")
+	empty := filepath.Join(root, "empty.md")
+	for name, source := range map[string]string{
+		missing:                            "![a](missing.png) ![b](missing.png)",
+		present:                            "![a](present.png)",
+		empty:                              "No images.",
+		filepath.Join(root, "present.png"): "image",
+	} {
+		if err := os.WriteFile(name, []byte(source), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, tt := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"before filename", []string{"-F", "-c", missing}, missing + "\n"},
+		{"after filename", []string{missing, "-c", "-F"}, missing + "\n"},
+		{"overrides images only", []string{"-F", "-c", "-i", missing}, missing + "\n"},
+		{"multiple documents", []string{"-F", "-c", missing, present, empty}, missing + "\n" + present + "\n"},
+		{"failed documents", []string{"-F", "-c", "-n", present, missing, empty}, missing + "\n"},
+		{"filtered out", []string{"-F", "-c", "--web", missing}, ""},
+		{"repeated file arguments", []string{"-F", "-c", "-f", missing, "-f", missing}, missing + "\n" + missing + "\n"},
+		{"ignored without check", []string{"-F", present}, listing(present, "present.png")},
+		{"ignored with images only without check", []string{"-F", "-i", present}, "\x1b[33mpresent.png\x1b[0m\n"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var out, errOut bytes.Buffer
+			if code := run(tt.args, &out, &errOut); code != 0 || out.String() != tt.want || errOut.Len() != 0 {
+				t.Errorf("args %v: code=%d stdout=%q stderr=%q; want stdout=%q", tt.args, code, out.String(), errOut.String(), tt.want)
+			}
+		})
+	}
+}
+
 func TestVersion(t *testing.T) {
 	for _, tt := range []struct{ arg, want string }{
 		{"-v", version + "\n"},
