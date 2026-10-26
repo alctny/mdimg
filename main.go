@@ -48,8 +48,8 @@ func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }
 
 // Overridden by the build script through go build -ldflags -X.
 var (
-	version     = "v1.0.1"
-	buildDate   = "2026-10-26"
+	version     = "dev"
+	buildDate   = "unknown"
 	gitCommit   = "unknown"
 	gitTag      = "unknown"
 	developers  = "GPT6-Astra and Ant"
