@@ -2,6 +2,22 @@
 
 提取 Markdown 文檔引用的圖片路徑。以 Go 實作，編譯後為單一執行檔，不需要安裝 Go、Python 或其他執行環境。
 
+## 安裝
+
+已安裝 Go 1.23 或更新版本時，可直接從 GitHub 下載並安裝，無需先 clone 儲存庫：
+
+```sh
+go install github.com/alctny/mdimg@latest
+```
+
+更新到最新版本時，重新執行相同命令即可。`@latest` 優先選擇最新穩定版本標籤；沒有版本標籤時，使用預設分支的最新提交。若要安裝 `main` 分支的最新程式碼：
+
+```sh
+go install github.com/alctny/mdimg@main
+```
+
+執行檔安裝到 `go env GOBIN` 指定的目錄；若未設定，則使用 `go env GOPATH` 下的 `bin` 目錄（預設為 macOS／Linux 的 `$HOME/go/bin` 或 Windows 的 `%USERPROFILE%\go\bin`）。請將該目錄加入 `PATH`，之後即可在任意目錄執行 `mdimg --help`；Windows 的執行檔名稱為 `mdimg.exe`。
+
 ## 使用
 
 ```sh

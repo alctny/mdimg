@@ -1,4 +1,4 @@
-module mdimg
+module github.com/alctny/mdimg
 
 go 1.23.0
 
