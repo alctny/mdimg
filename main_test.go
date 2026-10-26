@@ -37,8 +37,133 @@ func TestImagePaths(t *testing.T) {
 		"\\![escaped](bad5.png) [link](bad6.png) ![missing][unknown] ![empty]()\n" +
 		"![duplicate](images/a.png)\n"
 	want := []string{"images/a.png", "https://example.com/a.png", "images/a b.png", "a(b).png", "/logo.svg", "/logo.svg", "/logo.svg", "a(b).png", "x.png?a=1&b=2", "//cdn.example/a.png", "local.jpg", "images/a.png"}
-	if got := imagePaths([]byte(source)); !reflect.DeepEqual(got, want) {
-		t.Fatalf("got %#v\nwant %#v", got, want)
+	for _, wikilinks := range []bool{false, true} {
+		if got := imagePaths([]byte(source), wikilinks); !reflect.DeepEqual(got, want) {
+			t.Fatalf("wikilinks=%t: got %#v\nwant %#v", wikilinks, got, want)
+		}
+	}
+}
+
+func TestWikilinkImagePaths(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		source string
+		want   []string
+	}{
+		{"sizes and spaces", "![[photo.png]] ![[assets/圖片 a.jpg|300]] ![[photo.png|300x200]]", []string{"photo.png", "assets/圖片 a.jpg", "photo.png"}},
+		{"formats", "![[a.avif]] ![[b.BMP]] ![[c.gif]] ![[d.jpeg]] ![[e.JPG]] ![[f.PNG]] ![[g.svg]] ![[h.webp]]", []string{"a.avif", "b.BMP", "c.gif", "d.jpeg", "e.JPG", "f.PNG", "g.svg", "h.webp"}},
+		{"mixed order", "![a](a.png) ![[b.png]] <img src='c.png'> ![ref][r] ![[b.png]]\n\n[r]: ref.png", []string{"a.png", "b.png", "c.png", "ref.png", "b.png"}},
+		{"paths", `![[./a%20b.png]] ![[.\a+b.png]] ![[C:\images\圖.png]] ![[../a.png]] ![[ /tmp/a.png |300]]`, []string{"./a%20b.png", `.\a+b.png`, `C:\images\圖.png`, "../a.png", "/tmp/a.png"}},
+		{"escapes and entities", `![[a\ b.png]] ![[a&#32;b.png]] ![[a&amp;b.png]]`, []string{"a b.png", "a b.png", "a&b.png"}},
+		{"URL suffixes", "![[https://example.com/a.png?x=1#part|300]]", []string{"https://example.com/a.png?x=1#part"}},
+		{"non-images", "[[a.png]] [[note|alias]] ![[note]] ![[note.md]] ![[note#heading]] ![[note#^block]] ![[audio.mp3]] ![[video.mp4]] ![[file.pdf]]", nil},
+		{"empty and malformed", "![[]] ![[|300]] ![[   ]] ![[a.png] ![[b.png\n]]", nil},
+		{"code and comments", "`![[inline.png]]`\n\n```md\n![[fenced.png]]\n```\n\n    ![[indented.png]]\n\n<!-- ![[comment.png]] -->", nil},
+		{"escaped", `\![[hidden.png]] !\[[hidden.png]] ![[shown.png]]`, []string{"shown.png"}},
+		{"image alt text", "![![[hidden.png]]](outer.png)", []string{"outer.png"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := imagePaths([]byte(tt.source), true); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("got %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+	if got := imagePaths([]byte("![[photo.png]] ![[photo.png|300]]"), false); len(got) != 0 {
+		t.Errorf("wikilinks enabled by default: %v", got)
+	}
+}
+
+func TestWikilinksCLI(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "wiki.md")
+	if err := os.WriteFile(file, []byte("![a](native.png) ![[wiki.png|300]] <img src='html.png'> ![[wiki.png]]"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, tt := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"disabled", []string{file}, listing(file, "native.png", "html.png")},
+		{"before filename", []string{"--wikilinks", file}, listing(file, "native.png", "wiki.png", "html.png", "wiki.png")},
+		{"after filename", []string{file, "--wikilinks"}, listing(file, "native.png", "wiki.png", "html.png", "wiki.png")},
+		{"multiple files", []string{"-i", "-t", "-f", file, "--wikilinks", "-f", file}, strings.Repeat("native.png\nwiki.png\nhtml.png\nwiki.png\n", 2)},
+		{"end options", []string{"--wikilinks", "--", file}, listing(file, "native.png", "wiki.png", "html.png", "wiki.png")},
+		{"filenames only", []string{"--wikilinks", "-c", "-F", "-n", file}, file + "\n"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var out, errOut bytes.Buffer
+			if code := run(tt.args, &out, &errOut); code != 0 || out.String() != tt.want || errOut.Len() != 0 {
+				t.Errorf("code=%d stdout=%q stderr=%q, want stdout=%q", code, out.String(), errOut.String(), tt.want)
+			}
+		})
+	}
+}
+
+func TestWikilinksCheckParity(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.URL.Path == "/missing.png" {
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	root := t.TempDir()
+	prefix := filepath.Join(root, "assets")
+	for _, dir := range []string{prefix, filepath.Join(root, "directory.png")} {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, path := range []string{filepath.Join(root, "a b.png"), filepath.Join(prefix, "prefix.png")} {
+		if err := os.WriteFile(path, []byte("image"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	paths := []string{"a%20b.png", "./a%20b.png", `.\a%20b.png`, "missing.png", "directory.png", "prefix.png", filepath.ToSlash(filepath.Join(prefix, "prefix.png")), server.URL + "/ok.png", server.URL + "/missing.png"}
+	var native, wiki strings.Builder
+	for _, path := range paths {
+		fmt.Fprintf(&native, "![image](%s)\n", path)
+		fmt.Fprintf(&wiki, "![[%s|300]]\n", path)
+	}
+	nativeFile, wikiFile := filepath.Join(root, "native.md"), filepath.Join(root, "wiki.md")
+	for file, source := range map[string]string{nativeFile: native.String(), wikiFile: wiki.String()} {
+		if err := os.WriteFile(file, []byte(source), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, flags := range [][]string{
+		{}, {"-c"}, {"-c", "-n"}, {"-c", "-w"}, {"-c", "-w", "-n"},
+		{"-c", "-p", prefix}, {"-c", "-P", "assets"}, {"-c", "-l"}, {"-c", "--web"},
+		{"-c", "-t", "--convert"},
+	} {
+		t.Run(strings.Join(flags, " "), func(t *testing.T) {
+			var outputs [2]string
+			for i, file := range []string{nativeFile, wikiFile} {
+				requests = 0
+				args := append([]string{"-i", "-f", file}, flags...)
+				if i == 1 {
+					args = append(args, "--wikilinks")
+				}
+				var out, errOut bytes.Buffer
+				if code := run(args, &out, &errOut); code != 0 || errOut.Len() != 0 {
+					t.Fatalf("code=%d stderr=%q", code, errOut.String())
+				}
+				wantRequests := 0
+				for _, flag := range flags {
+					if flag == "-w" {
+						wantRequests = 2
+					}
+				}
+				if requests != wantRequests {
+					t.Errorf("requests=%d, want %d", requests, wantRequests)
+				}
+				outputs[i] = out.String()
+			}
+			if outputs[0] != outputs[1] {
+				t.Errorf("native=%q, wikilinks=%q", outputs[0], outputs[1])
+			}
+		})
 	}
 }
 
@@ -222,7 +347,7 @@ func TestChecksAndDiscovery(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	write("top.md", "![a](top.png)")
+	write("top.md", "![a](top.png) ![[wiki.png]]")
 	write("top.png", "image")
 	write("nested/doc.MD", "![a](assets/a%20b.png) ![b](assets\\a%20b.png) ![c](absent.png) ![d](https://example.invalid/a.png) ![e](assets/a\\ b.png)")
 	write("nested/assets/a b.png", "image")
@@ -233,6 +358,7 @@ func TestChecksAndDiscovery(t *testing.T) {
 		want string
 	}{
 		{nil, listing("top.md", "top.png")},
+		{[]string{"--wikilinks"}, listing("top.md", "top.png", "wiki.png")},
 		{[]string{"-r"}, listing("nested/doc.MD", "assets/a%20b.png", "assets\\a%20b.png", "absent.png", "https://example.invalid/a.png", "assets/a b.png") + listing("nested/prefix.md", "a%20b.png") + listing("top.md", "top.png")},
 		{[]string{"-c", "-f", "top.md"}, "top.md\n    \x1b[32m[v] top.png\x1b[0m\n"},
 		{[]string{"-c", "-n", "-f", "top.md"}, ""},

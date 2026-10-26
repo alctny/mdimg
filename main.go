@@ -14,31 +14,33 @@ import (
 
 	"github.com/yuin/goldmark"
 	"github.com/yuin/goldmark/ast"
+	"github.com/yuin/goldmark/parser"
 	"github.com/yuin/goldmark/text"
 	"github.com/yuin/goldmark/util"
 	"golang.org/x/net/html"
 )
 
-const usage = `Usage: mdimg [-c] [-F] [-i] [-t] [--convert] [-f file.md] [-r] [-p prefix | -P prefix] [-n] [-w]
+const usage = `Usage: mdimg [-c] [-F] [-i] [-t] [--convert] [--wikilinks] [-f file.md] [-r] [-p prefix | -P prefix] [-n] [-w]
 
 Print filenames and indented image destinations in document order.
 Local destinations are yellow; HTTP(S) destinations are blue unless checked.
-  -i           Hide filenames and indentation; retain colors and check marks unless -t
-  -t           Only plain filenames and image destinations; no ANSI, marks or indentation
-  --convert    Decode percent escapes in output; use native local path separators
-  -v           Print version only
-  -V, --version Print version, build date, Git commit/tag and developer details
   -l, --local   Only local paths (including file: URLs)
   --web        Only HTTP(S) and protocol-relative URLs
-  -c           Check image existence, grouped by Markdown file
-  -F           Only print filenames with matching images (with -c); overrides -i
+  --convert    Decode percent escapes in output; use native local path separators
+  --wikilinks  Also extract Obsidian image embeds ![[image.png|width]]
   -f file.md   Read this file (repeatable); default: *.md in current directory
-  -r           Recursively discover Markdown files
-  -p prefix    Image prefix relative to working directory (with -c)
-  -P prefix    Image prefix relative to Markdown directory (with -c)
+  -c           Check image existence, grouped by Markdown file
+    -F         Only print filenames with matching images (with -c); overrides -i
+    -w         Check HTTP(S) accessibility (with -c); otherwise skip requests
+    -r         Recursively discover Markdown files
+    -p prefix  Image prefix relative to working directory (with -c)
+    -P prefix  Image prefix relative to Markdown directory (with -c)
                Paths starting with ./ or .\ always ignore either prefix
-  -n           Only show failed checks (with -c)
-  -w           Check HTTP(S) accessibility (with -c); otherwise skip requests
+    -n         Only show failed checks (with -c)
+  -i           Hide filenames and indentation; retain colors and check marks unless -t
+  -t           Only plain filenames and image destinations; no ANSI, marks or indentation
+  -v           Print version only
+  -V, --version Print version, build date, Git commit/tag and developer details
   -h, --help    Show help
   --            End options (for filenames beginning with -)
 
@@ -60,7 +62,7 @@ var (
 
 func run(args []string, out, errOut io.Writer) int {
 	var local, web, endOptions, imagesOnly, plainText, convert bool
-	var filenamesOnly bool
+	var filenamesOnly, wikilinks bool
 	var check, recursive, missingOnly, checkWeb, relativePrefix, hasPrefix bool
 	var prefix string
 	var files []string
@@ -100,6 +102,9 @@ func run(args []string, out, errOut io.Writer) int {
 				continue
 			case "--convert":
 				convert = true
+				continue
+			case "--wikilinks":
+				wikilinks = true
 				continue
 			case "-r":
 				recursive = true
@@ -168,7 +173,7 @@ func run(args []string, out, errOut io.Writer) int {
 			continue
 		}
 		header := false
-		for _, path := range imagePaths(source) {
+		for _, path := range imagePaths(source, wikilinks) {
 			kind := classify(path)
 			if local && kind != "local" || web && kind != "web" {
 				continue
@@ -304,7 +309,7 @@ func webExists(client *http.Client, path string) bool {
 	return resp.StatusCode >= 200 && resp.StatusCode < 300
 }
 
-func imagePaths(source []byte) []string {
+func imagePaths(source []byte, wikilinks bool) []string {
 	// Accept backslash-escaped spaces in bare destinations as well as %20.
 	source = bytes.ReplaceAll(source, []byte(`\ `), []byte("&#32;"))
 	var paths []string
@@ -313,7 +318,12 @@ func imagePaths(source []byte) []string {
 			paths = append(paths, path)
 		}
 	}
-	doc := goldmark.New().Parser().Parse(text.NewReader(source))
+	markdown := goldmark.New()
+	if wikilinks {
+		// Recognize image embeds before the default Markdown link parser.
+		markdown.Parser().AddOptions(parser.WithInlineParsers(util.Prioritized(wikilinkParser{}, 150)))
+	}
+	doc := markdown.Parser().Parse(text.NewReader(source))
 	_ = ast.Walk(doc, func(node ast.Node, entering bool) (ast.WalkStatus, error) {
 		if !entering {
 			return ast.WalkContinue, nil
@@ -334,6 +344,47 @@ func imagePaths(source []byte) []string {
 		return ast.WalkContinue, nil
 	})
 	return paths
+}
+
+// wikilinkParser adds Obsidian image embeds to the existing image AST.
+type wikilinkParser struct{}
+
+func (wikilinkParser) Trigger() []byte { return []byte{'!'} }
+
+func (wikilinkParser) Parse(_ ast.Node, block text.Reader, _ parser.Context) ast.Node {
+	line, _ := block.PeekLine()
+	if !bytes.HasPrefix(line, []byte("![[")) {
+		return nil
+	}
+	end := bytes.Index(line[3:], []byte("]]"))
+	if end < 0 {
+		return nil
+	}
+	end += 3
+	content := line[3:end]
+	if bytes.ContainsAny(content, "[]\r\n") {
+		return nil
+	}
+	destination, _, _ := bytes.Cut(content, []byte("|"))
+	destination = bytes.TrimSpace(destination)
+	// Obsidian also embeds notes, audio, video and PDFs with ![[...]].
+	// Inspect the extension only; leave the address intact for existing checks.
+	value := util.UnescapePunctuations(destination)
+	value = util.ResolveNumericReferences(value)
+	value = util.ResolveEntityNames(value)
+	path := string(value)
+	if i := strings.IndexAny(path, "?#"); i >= 0 {
+		path = path[:i]
+	}
+	switch strings.ToLower(filepath.Ext(portablePath(path))) {
+	case ".avif", ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".svg", ".webp":
+		link := ast.NewLink()
+		link.Destination = destination
+		block.Advance(end + 2)
+		return ast.NewImage(link)
+	default:
+		return nil
+	}
 }
 
 func htmlImages(source []byte, add func(string)) {
