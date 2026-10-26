@@ -7,7 +7,7 @@ if errorlevel 1 (
 )
 pushd "%~dp0"
 if errorlevel 1 exit /b 1
-go run ./scripts/build.go
+go run ./scripts/build.go %*
 set "BUILD_EXIT=%ERRORLEVEL%"
 popd
 exit /b %BUILD_EXIT%
