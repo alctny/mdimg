@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -20,21 +21,26 @@ import (
 	"golang.org/x/net/html"
 )
 
-const usage = `Usage: mdimg [-c] [-F] [-i] [-t] [--convert] [--wikilinks] [-f file.md] [-r] [-p prefix | -P prefix] [-n] [-w]
+const usage = `Usage: mdimg [-c] [-F] [-i] [-t] [--convert] [--wikilinks] [--scc] [--exclude regex] [-f file.md] [-r] [-p prefix | -P prefix] [-n] [-w]
 
 Print filenames and indented image destinations in document order.
 Local destinations are yellow; HTTP(S) destinations are blue unless checked.
   -l, --local   Only local paths (including file: URLs)
   --web        Only HTTP(S) and protocol-relative URLs
   --convert    Decode percent escapes in output; use native local path separators
+  --scc        Print image statistics; automatically check local and HTTP(S) images
+               Supports -r, -f, filters, -p, -P and --wikilinks
+               Overrides listing options -i, -t, -F, -n and --convert
+  --exclude regex  Skip matching document directories (repeatable; with -c or --scc)
+                   Match working-directory-relative paths using / separators
   --wikilinks  Also extract Obsidian image embeds ![[image.png|width]]
   -f file.md   Read this file (repeatable); default: *.md in current directory
   -c           Check image existence, grouped by Markdown file
     -F         Only print filenames with matching images (with -c); overrides -i
     -w         Check HTTP(S) accessibility (with -c); otherwise skip requests
     -r         Recursively discover Markdown files
-    -p prefix  Image prefix relative to working directory (with -c)
-    -P prefix  Image prefix relative to Markdown directory (with -c)
+    -p prefix  Image prefix relative to working directory (with -c or --scc)
+    -P prefix  Image prefix relative to Markdown directory (with -c or --scc)
                Paths starting with ./ or .\ always ignore either prefix
     -n         Only show failed checks (with -c)
   -i           Hide filenames and indentation; retain colors and check marks unless -t
@@ -62,10 +68,11 @@ var (
 
 func run(args []string, out, errOut io.Writer) int {
 	var local, web, endOptions, imagesOnly, plainText, convert bool
-	var filenamesOnly, wikilinks bool
+	var filenamesOnly, wikilinks, statistics bool
 	var check, recursive, missingOnly, checkWeb, relativePrefix, hasPrefix bool
 	var prefix string
 	var files []string
+	var exclusions []*regexp.Regexp
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		if !endOptions {
@@ -103,6 +110,9 @@ func run(args []string, out, errOut io.Writer) int {
 			case "--convert":
 				convert = true
 				continue
+			case "--scc":
+				statistics = true
+				continue
 			case "--wikilinks":
 				wikilinks = true
 				continue
@@ -115,13 +125,20 @@ func run(args []string, out, errOut io.Writer) int {
 			case "-w":
 				checkWeb = true
 				continue
-			case "-f", "-p", "-P":
+			case "-f", "-p", "-P", "--exclude":
 				if i+1 >= len(args) || strings.HasPrefix(args[i+1], "-") || args[i+1] == "" {
 					fmt.Fprintf(errOut, "mdimg: %s requires an argument\n", arg)
 					return 2
 				}
 				i++
-				if arg == "-f" {
+				if arg == "--exclude" {
+					pattern, err := regexp.Compile(args[i])
+					if err != nil {
+						fmt.Fprintf(errOut, "mdimg: invalid --exclude regex %q: %v\n", args[i], err)
+						return 2
+					}
+					exclusions = append(exclusions, pattern)
+				} else if arg == "-f" {
 					files = append(files, portablePath(args[i]))
 				} else {
 					if hasPrefix {
@@ -144,13 +161,25 @@ func run(args []string, out, errOut io.Writer) int {
 		fmt.Fprint(errOut, usage)
 		return 2
 	}
+	var exclusionRoot string
+	if (check || statistics) && len(exclusions) > 0 {
+		var err error
+		exclusionRoot, err = os.Getwd()
+		if err != nil {
+			fmt.Fprintf(errOut, "mdimg: %v\n", err)
+			return 1
+		}
+	}
+	excluded := func(dir string) bool {
+		return exclusionRoot != "" && excludedDirectory(dir, exclusionRoot, exclusions)
+	}
 	if len(files) == 0 {
 		err := filepath.WalkDir(".", func(path string, entry fs.DirEntry, err error) error {
 			if err != nil {
 				return err
 			}
 			if entry.IsDir() {
-				if path != "." && !recursive {
+				if excluded(path) || path != "." && !recursive {
 					return filepath.SkipDir
 				}
 			} else if strings.EqualFold(filepath.Ext(path), ".md") {
@@ -165,17 +194,39 @@ func run(args []string, out, errOut io.Writer) int {
 	}
 	client := &http.Client{Timeout: 10 * time.Second}
 	status := 0
+	var counts imageStatistics
 	for _, file := range files {
+		if excluded(filepath.Dir(portablePath(file))) {
+			continue
+		}
 		source, err := os.ReadFile(file)
 		if err != nil {
 			fmt.Fprintf(errOut, "mdimg: %v\n", err)
 			status = 1
 			continue
 		}
+		counts.documents++
 		header := false
-		for _, path := range imagePaths(source, wikilinks) {
+		for _, reference := range imageReferences(source, wikilinks) {
+			path := reference.path
 			kind := classify(path)
 			if local && kind != "local" || web && kind != "web" {
+				continue
+			}
+			if statistics {
+				counts.add(reference)
+				valid := false
+				switch kind {
+				case "web":
+					valid = webExists(client, path)
+				case "local":
+					valid = localExists(path, file, prefix, hasPrefix, relativePrefix)
+				}
+				if valid {
+					counts.valid++
+				} else {
+					counts.invalid++
+				}
 				continue
 			}
 			color := "33"
@@ -199,16 +250,7 @@ func run(args []string, out, errOut io.Writer) int {
 						mark, color = "wv", "32"
 					}
 				} else if kind != "web" {
-					base := filepath.Dir(file)
-					if hasPrefix && !strings.HasPrefix(path, "./") && !strings.HasPrefix(path, `.\`) {
-						base = prefix
-						if relativePrefix && !filepath.IsAbs(prefix) {
-							base = filepath.Join(filepath.Dir(file), prefix)
-						}
-					}
-					resolved, resolveErr := localPath(path, base)
-					info, statErr := os.Stat(resolved)
-					failed = resolveErr != nil || statErr != nil || info.IsDir()
+					failed = !localExists(path, file, prefix, hasPrefix, relativePrefix)
 					if failed {
 						mark, color = "x", "31"
 					} else {
@@ -249,7 +291,100 @@ func run(args []string, out, errOut io.Writer) int {
 			}
 		}
 	}
+	if statistics {
+		if err := counts.write(out); err != nil {
+			fmt.Fprintf(errOut, "mdimg: write output: %v\n", err)
+			return 1
+		}
+	}
 	return status
+}
+
+// excludedDirectory checks the directory and its ancestors relative to root.
+// Matching ancestors also excludes explicitly selected files in their subtrees.
+func excludedDirectory(dir, root string, patterns []*regexp.Regexp) bool {
+	if !filepath.IsAbs(dir) {
+		dir = filepath.Join(root, dir)
+	}
+	if relative, err := filepath.Rel(root, dir); err == nil {
+		dir = relative
+	}
+	for {
+		for _, pattern := range patterns {
+			if pattern.MatchString(filepath.ToSlash(dir)) {
+				return true
+			}
+		}
+		parent := filepath.Dir(dir)
+		if dir == "." || dir == ".." || parent == dir {
+			return false
+		}
+		dir = parent
+	}
+}
+
+// imageStatistics counts references, including repeated destinations.
+type imageStatistics struct {
+	documents, total, local, web int
+	markdown, wikilinks          int
+	absolute, relative           int
+	valid, invalid               int
+}
+
+func (s *imageStatistics) add(reference imageReference) {
+	s.total++
+	switch classify(reference.path) {
+	case "local":
+		s.local++
+	case "web":
+		s.web++
+	}
+	switch reference.syntax {
+	case "markdown":
+		s.markdown++
+	case "wikilinks":
+		s.wikilinks++
+	}
+	if absoluteDestination(reference.path) {
+		s.absolute++
+	} else {
+		s.relative++
+	}
+}
+
+func (s imageStatistics) write(out io.Writer) error {
+	_, err := fmt.Fprintf(out, "Markdown documents: %d\nTotal images: %d\nLocal images: %d\nNetwork images: %d\nMarkdown syntax images: %d\nWikilinks syntax images: %d\nAbsolute address images: %d\nRelative address images: %d\nValid images: %d\nInvalid images: %d\n",
+		s.documents, s.total, s.local, s.web, s.markdown, s.wikilinks,
+		s.absolute, s.relative, s.valid, s.invalid)
+	return err
+}
+
+func absoluteDestination(path string) bool {
+	if classify(path) != "local" {
+		return true
+	}
+	if strings.HasPrefix(strings.ToLower(path), "file:") {
+		return true
+	}
+	if decoded, err := url.PathUnescape(path); err == nil {
+		path = decoded
+	}
+	path = strings.ReplaceAll(path, `\`, "/")
+	return strings.HasPrefix(path, "/") ||
+		(len(path) >= 3 && path[1] == ':' && path[2] == '/')
+}
+
+func localExists(path, file, prefix string, hasPrefix, relativePrefix bool) bool {
+	base := filepath.Dir(file)
+	if hasPrefix && !strings.HasPrefix(path, "./") && !strings.HasPrefix(path, `.\`) {
+		base = prefix
+		if relativePrefix && !filepath.IsAbs(prefix) {
+			base = filepath.Join(filepath.Dir(file), prefix)
+		}
+	}
+	resolved, resolveErr := localPath(path, base)
+	info, statErr := os.Stat(resolved)
+	return resolveErr == nil && statErr == nil && !info.IsDir()
 }
 
 func portablePath(path string) string { return filepath.FromSlash(strings.ReplaceAll(path, `\`, "/")) }
@@ -309,13 +444,26 @@ func webExists(client *http.Client, path string) bool {
 	return resp.StatusCode >= 200 && resp.StatusCode < 300
 }
 
+type imageReference struct {
+	path   string
+	syntax string
+}
+
 func imagePaths(source []byte, wikilinks bool) []string {
+	var paths []string
+	for _, reference := range imageReferences(source, wikilinks) {
+		paths = append(paths, reference.path)
+	}
+	return paths
+}
+
+func imageReferences(source []byte, wikilinks bool) []imageReference {
 	// Accept backslash-escaped spaces in bare destinations as well as %20.
 	source = bytes.ReplaceAll(source, []byte(`\ `), []byte("&#32;"))
-	var paths []string
-	add := func(path string) {
+	var references []imageReference
+	add := func(path, syntax string) {
 		if path != "" {
-			paths = append(paths, path)
+			references = append(references, imageReference{path: path, syntax: syntax})
 		}
 	}
 	markdown := goldmark.New()
@@ -333,17 +481,21 @@ func imagePaths(source []byte, wikilinks bool) []string {
 			value := util.UnescapePunctuations(n.Destination)
 			value = util.ResolveNumericReferences(value)
 			value = util.ResolveEntityNames(value)
-			add(string(value))
+			syntax := "markdown"
+			if _, ok := n.AttributeString("wikilink"); ok {
+				syntax = "wikilinks"
+			}
+			add(string(value), syntax)
 			// Nested image syntax is alt text, not another rendered image.
 			return ast.WalkSkipChildren, nil
 		case *ast.RawHTML:
-			htmlImages(n.Segments.Value(source), add)
+			htmlImages(n.Segments.Value(source), func(path string) { add(path, "html") })
 		case *ast.HTMLBlock:
-			htmlImages(n.Text(source), add)
+			htmlImages(n.Text(source), func(path string) { add(path, "html") })
 		}
 		return ast.WalkContinue, nil
 	})
-	return paths
+	return references
 }
 
 // wikilinkParser adds Obsidian image embeds to the existing image AST.
@@ -381,7 +533,9 @@ func (wikilinkParser) Parse(_ ast.Node, block text.Reader, _ parser.Context) ast
 		link := ast.NewLink()
 		link.Destination = destination
 		block.Advance(end + 2)
-		return ast.NewImage(link)
+		image := ast.NewImage(link)
+		image.SetAttributeString("wikilink", true)
+		return image
 	default:
 		return nil
 	}

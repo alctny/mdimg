@@ -522,3 +522,209 @@ func TestConvert(t *testing.T) {
 		}
 	}
 }
+
+func TestImageReferenceSyntax(t *testing.T) {
+	source := []byte("![a](a.png) ![[wiki.png]] <img src='html.png'> ![ref][r]\n\n[r]: ref.png\n\n`![[hidden.png]]`\n<!-- ![hidden](hidden.png) -->")
+	want := []imageReference{{"a.png", "markdown"}, {"wiki.png", "wikilinks"}, {"html.png", "html"}, {"ref.png", "markdown"}}
+	if got := imageReferences(source, true); !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %#v, want %#v", got, want)
+	}
+}
+
+func TestAbsoluteDestination(t *testing.T) {
+	for _, tt := range []struct {
+		path string
+		want bool
+	}{
+		{"image.png", false}, {"../image.png", false}, {"./image.png", false},
+		{"/image.png", true}, {`C:\images\a.png`, true}, {"C:/images/a.png", true},
+		{`\\server\share\a.png`, true}, {"%2Fimages/a.png", true},
+		{"https://example.com/a.png", true}, {"//example.com/a.png", true},
+		{"file:///tmp/a.png", true}, {"data:image/png;base64,abc", true},
+	} {
+		t.Run(tt.path, func(t *testing.T) {
+			if got := absoluteDestination(tt.path); got != tt.want {
+				t.Errorf("got %t, want %t", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestStatisticsCLI(t *testing.T) {
+	root := t.TempDir()
+	old, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(old) })
+	write := func(name, content string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(name), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(name, []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.Method != http.MethodGet {
+			t.Errorf("method = %s", r.Method)
+		}
+		switch r.URL.Path {
+		case "/redirect.png":
+			http.Redirect(w, r, "/ok.png", http.StatusFound)
+		case "/ok.png":
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	write("empty.MD", "no images")
+	write("ignored.txt", "![ignored](absent.png)")
+	write("ok.png", "image")
+	write("assets/prefix.png", "image")
+	write("nested/assets/prefix.png", "image")
+	write("nested/local.png", "image")
+	write("nested/doc.md", "![prefix](prefix.png) ![dot](./local.png) ![[prefix.png]]")
+	write("doc.md", "![ok](ok.png) ![duplicate](ok.png) ![missing](missing.png) ![[ok.png]] <img src='ok.png'> ![web]("+server.URL+"/redirect.png) ![bad]("+server.URL+"/bad.png) ![other](data:image/png;base64,abc)")
+	for _, tt := range []struct {
+		name     string
+		args     []string
+		counts   []int
+		requests int
+	}{
+		{"default discovery", []string{"--scc"}, []int{2, 7, 4, 2, 6, 0, 3, 4, 4, 3}, 3},
+		{"wiki discovery", []string{"--scc", "--wikilinks"}, []int{2, 8, 5, 2, 6, 1, 3, 5, 5, 3}, 3},
+		{"recursive", []string{"--scc", "--wikilinks", "-r"}, []int{3, 11, 8, 2, 8, 2, 3, 8, 6, 5}, 3},
+		{"working prefix", []string{"--scc", "--wikilinks", "-p", "assets", "nested/doc.md"}, []int{1, 3, 3, 0, 2, 1, 0, 3, 3, 0}, 0},
+		{"document prefix", []string{"--scc", "--wikilinks", "-P", "assets", "nested/doc.md"}, []int{1, 3, 3, 0, 2, 1, 0, 3, 3, 0}, 0},
+		{"explicit ignores recursion", []string{"--scc", "-r", "empty.MD"}, []int{1, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0},
+		{"local filter", []string{"--scc", "-l"}, []int{2, 4, 4, 0, 3, 0, 0, 4, 3, 1}, 0},
+		{"web filter", []string{"--scc", "--web"}, []int{2, 2, 0, 2, 2, 0, 2, 0, 1, 1}, 3},
+		{"listing flags", []string{"--scc", "-i", "-t", "-F", "-n", "--convert"}, []int{2, 7, 4, 2, 6, 0, 3, 4, 4, 3}, 3},
+		{"repeated files", []string{"--scc", "-f", "nested/doc.md", "-f", "nested/doc.md"}, []int{2, 4, 4, 0, 4, 0, 0, 4, 2, 2}, 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			requests = 0
+			var out, errOut bytes.Buffer
+			code := run(tt.args, &out, &errOut)
+			labels := []string{"Markdown documents", "Total images", "Local images", "Network images", "Markdown syntax images", "Wikilinks syntax images", "Absolute address images", "Relative address images", "Valid images", "Invalid images"}
+			var want strings.Builder
+			for i, label := range labels {
+				fmt.Fprintf(&want, "%s: %d\n", label, tt.counts[i])
+			}
+			if code != 0 || errOut.Len() != 0 || out.String() != want.String() {
+				t.Errorf("code=%d stderr=%q stdout=%q; want %q", code, errOut.String(), out.String(), want.String())
+			}
+			if requests != tt.requests {
+				t.Errorf("requests=%d, want %d", requests, tt.requests)
+			}
+		})
+	}
+	var out, errOut bytes.Buffer
+	if code := run([]string{"--scc", "absent.md", "empty.MD"}, &out, &errOut); code != 1 || errOut.Len() == 0 || !strings.HasPrefix(out.String(), "Markdown documents: 1\nTotal images: 0\n") {
+		t.Errorf("read failure: code=%d stdout=%q stderr=%q", code, out.String(), errOut.String())
+	}
+	errOut.Reset()
+	if code := run([]string{"--scc", "empty.MD"}, statisticsFailWriter{}, &errOut); code != 1 || !strings.Contains(errOut.String(), "write output") {
+		t.Errorf("write failure: code=%d stderr=%q", code, errOut.String())
+	}
+	if err := os.Chdir(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	errOut.Reset()
+	if code := run([]string{"--scc"}, &out, &errOut); code != 0 || errOut.Len() != 0 || !strings.HasPrefix(out.String(), "Markdown documents: 0\nTotal images: 0\n") {
+		t.Errorf("empty directory: code=%d stdout=%q stderr=%q", code, out.String(), errOut.String())
+	}
+}
+
+type statisticsFailWriter struct{}
+
+func (statisticsFailWriter) Write([]byte) (int, error) { return 0, fmt.Errorf("test write failure") }
+
+func TestExcludeCLI(t *testing.T) {
+	root := t.TempDir()
+	old, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(old) })
+	for _, file := range []string{"top.md", "skip/doc.md", "skip/deep/doc.md", "keep/doc.MD", "keep/cache/doc.md"} {
+		if err := os.MkdirAll(filepath.Dir(file), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(file, []byte("![image](missing.png)"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	summary := func(n int) string {
+		return fmt.Sprintf("Markdown documents: %d\nTotal images: %d\nLocal images: %d\nNetwork images: 0\nMarkdown syntax images: %d\nWikilinks syntax images: 0\nAbsolute address images: 0\nRelative address images: %d\nValid images: 0\nInvalid images: %d\n", n, n, n, n, n, n)
+	}
+	checked := "top.md\n    \x1b[31m[x] missing.png\x1b[0m\n"
+	for _, tt := range []struct {
+		name      string
+		args      []string
+		want      string
+		code      int
+		errorText string
+	}{
+		{"statistics recursive", []string{"--scc", "-r", "--exclude", "(^|/)skip$"}, summary(3), 0, ""},
+		{"repeated patterns", []string{"--scc", "-r", "--exclude", "^skip$", "--exclude", "(^|/)cache$"}, summary(2), 0, ""},
+		{"relative path regex", []string{"--scc", "-r", "--exclude", "^(skip|keep/cache)$"}, summary(2), 0, ""},
+		{"check discovery", []string{"-c", "-r", "--exclude", "^(skip|keep)$"}, checked, 0, ""},
+		{"explicit ancestor", []string{"-c", "skip/deep/doc.md", "--exclude", "^skip$"}, "", 0, ""},
+		{"absolute explicit", []string{"--scc", "-f", filepath.Join(root, "skip", "deep", "doc.md"), "--exclude", "^skip$"}, summary(0), 0, ""},
+		{"windows separators", []string{"--scc", "-f", `skip\deep\doc.md`, "--exclude", "^skip$"}, summary(0), 0, ""},
+		{"excluded missing file", []string{"--scc", "skip/missing.md", "--exclude", "^skip$"}, summary(0), 0, ""},
+		{"explicit does not rediscover", []string{"--scc", "-r", "skip/doc.md", "--exclude", "^skip$"}, summary(0), 0, ""},
+		{"root directory", []string{"--scc", "-r", "--exclude", `^\.$`}, summary(0), 0, ""},
+		{"filename does not match", []string{"--scc", "--exclude", `\.md$`}, summary(1), 0, ""},
+		{"case sensitive", []string{"--scc", "-r", "--exclude", "^SKIP$"}, summary(5), 0, ""},
+		{"case insensitive", []string{"--scc", "-r", "--exclude", "(?i)^SKIP$"}, summary(3), 0, ""},
+		{"listing unchanged", []string{"--exclude", "^skip$", "skip/doc.md"}, listing("skip/doc.md", "missing.png"), 0, ""},
+		{"end options", []string{"--scc", "--exclude", "^skip$", "--", "skip/doc.md"}, summary(0), 0, ""},
+		{"invalid regex", []string{"--scc", "--exclude", "["}, "", 2, "invalid --exclude regex"},
+		{"missing argument", []string{"-c", "--exclude"}, "", 2, "--exclude requires an argument"},
+		{"empty argument", []string{"--scc", "--exclude", ""}, "", 2, "--exclude requires an argument"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var out, errOut bytes.Buffer
+			code := run(tt.args, &out, &errOut)
+			if code != tt.code || out.String() != tt.want || (tt.errorText == "" && errOut.Len() != 0) || (tt.errorText != "" && !strings.Contains(errOut.String(), tt.errorText)) {
+				t.Errorf("code=%d stdout=%q stderr=%q; want code=%d stdout=%q error=%q", code, out.String(), errOut.String(), tt.code, tt.want, tt.errorText)
+			}
+		})
+	}
+}
+
+func TestExcludeSkipsNetworkChecks(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("excluded document triggered an HTTP request")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	file := filepath.Join(t.TempDir(), "excluded", "doc.md")
+	if err := os.MkdirAll(filepath.Dir(file), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file, []byte("![web]("+server.URL+"/image.png)"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, flags := range [][]string{{"--scc"}, {"-c", "-w"}} {
+		var out, errOut bytes.Buffer
+		args := append(append([]string{}, flags...), "--exclude", "(^|/)excluded$", file)
+		if code := run(args, &out, &errOut); code != 0 || errOut.Len() != 0 {
+			t.Errorf("code=%d stderr=%q", code, errOut.String())
+		}
+	}
+}
